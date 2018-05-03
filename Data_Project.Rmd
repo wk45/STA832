@@ -1,0 +1,467 @@
+---
+title: "Data Project"
+author: "Woo Min Kim"
+
+output:
+  pdf_document: default
+header-includes: \usepackage{float}
+---
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+require(kableExtra)
+require(dplyr)
+require(xgboost)
+require(sp)
+require(rworldmap)
+require(maps)
+require(kernlab)
+```
+
+## 1. Introduction
+
+The data was obtained from the UCI require, and it contains geographical information of traditional songs around the world by providing a longitude and a latitude of each song: 1059 pieces of music from 33 countries/areas exist. The audio features were also extracted by using MARSYAS (Tzanetaks and Cook, 1999) from wave files. MARSYAS generates a vector length 68 to estimate the performance with basic timbre information covering the entire length of each track.
+
+The data is quite intersting because music, as a form of art, was mainly studied based on the subjective judgment. And this data-based approach on music is quite meaningful and desirable to seek the differences and similarities of different cultures around the world. This attempt is to find unique characteristics of traditional musics of each region, and it is really interesting to check whether the cultural differences can be expressed numerically. The data provides crudely approximated longitude and latitude of each music, and by solving regression problem we can expect to approximately predict the locations of the music origins.
+
+Prior to the data analysis, we can select features by using kernel PCA and factor analysis in order for more concise model. After finding the most appropriate number of features, the data analysis results by raw and new data will be compared whether the dimension reduction makes sense and which feature selection methods are the best. With this data, we can focus on both classification and regression problems; as analysis tools, linear regression and gradient boosting machine will be used. For the classification problem, a new variable named region was introduced and it divided the data into 15 different Global Environment Outlook (GEO) subregions.
+
+```{r echo=FALSE, message = FALSE}
+# data
+Y = read.table(file = "musics.txt",sep = ",")
+Y = cbind(Y[,c(69,70)], Y[,-c(69,70)])
+
+# Obtaining Larger Regions
+countriesSP = getMap(resolution='low')
+points = Y[,c(2,1)]
+pointsSP = SpatialPoints(points, proj4string=CRS(proj4string(countriesSP)))
+indices = over(pointsSP, countriesSP)
+Y = cbind(indices$GEO3,Y)
+Y[,1] = droplevels(Y[,1])
+
+
+# Computing Missing Regions Manually
+for (i in 1:1059){
+  if (is.na(Y[i,1]) == T) Y[i,1] = "Western Africa"
+}
+names(Y)[1:3] = c("reg","lat","lon")
+```
+
+## 2. Exploratory Data Analysis
+
+Prior to the data anlaysis, we need to explore the data first; especially, both dependent and independent variables. As can be seen in the figure 1, there exist relatively fewer observations on the map; there are 1059 observations, but there are only 33 unique pairs of latitude and longitude. According to the data source, the geographical location information was manually collected based on the description on the CD covers and gathering the exact locations was not physically possible; thereby rendering most of locations overlapping. This can be problematic because linear regression might not perform properly because the response variable might not have normal distribution. In order to check the normality assumption, residual plots will be investigated in the latter section. Furthurmore, instead of focusing on regression problem, we can try to solve the classification problem by solving multinomial model with multiple levels. In the following section, the extreme gradient boosting machine (XGBoost) will be introduced.
+
+```{r fig1, fig.height = 3, fig.width = 5, fig.cap = "Geographical Location: different shapes infer different regions.", fig.align='center', fig.pos='H', echo=FALSE, messgae = FALSE}
+{maps::map(fill=TRUE, col=1, xlim=c(-89,150), ylim=c(-36,55))
+  points(Y[,3],Y[,2], col="red", pch=as.numeric(Y[,1]))}
+```
+
+As explained previously, the audio features extracted from MARSYAS are vectors length of 68. All features are numerical and transformed to have a mean of 0 and standard deviation of 1. To check the relationship among variables, pairwise scatter plots can be investigated. 
+
+```{r fig2, fig.height = 5, fig.width = 5, fig.cap = "Pairwise Scatter Plots: these are the pairwise scatter plots among location variables and first three music features after Gaussian copula transformation. It is notable that music features seem uncorrelated to location variables. In addition, some of music features are highly correlated, and feature selection can also be considered.", fig.align='center', fig.pos='H', echo=FALSE, message = FALSE}
+
+# pair scatter function option
+panel.hist = function(x, ...)
+{
+  usr = par("usr"); on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h = hist(x, plot = FALSE)
+  breaks = h$breaks; nB = length(breaks)
+  y = h$counts; y = y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col = "cyan", ...)
+}
+
+# Gaussian Copula
+zscores=function(y,ties.method="average")
+{
+z=qnorm(rank(y,na.last="keep",ties.method=ties.method)/(sum(!is.na(y))+1) )
+names(z)=names(y)
+m=dim(y)
+if(length(m)==2){z=matrix(z,nrow=m[1],ncol=m[2]) ; dimnames(z)=dimnames(y)}
+if(length(m)>=3){z=array(z,dim=m) ; dimnames(z)=dimnames(y)}
+z
+}
+
+Ynew = apply(Y[,-1],2,zscores)
+pairs(Ynew[,1:6], diag.panel = panel.hist)
+```
+
+In order for better correlation estimation between response and explanatory variables, I first applied Gaussian copula transformation on the data set. As can be seen in the pair scatter plots (Figure 2) and histograms above, it is hard to say that there exist correlation between response and explanatory variables. The largest absolute values of correlations between response and explanatory variables were computed and none of exmplanatory variable has linear relationship with the location variable. This implies non-linear relationship should also be seeked. This can be done by introducing new interaction terms or polynomial terms; however, kernel PCA can also be great option in this case. 
+
+```{r echo=FALSE, message = FALSE}
+tab = t(as.data.frame(round(sort(abs(cor(Ynew)[-(1:2),1:2]),decreasing = T)[1:3],2)))
+colnames(tab) = c("","","")
+rownames(tab) = "|cor|"
+kable(tab, caption = "Three largest correlations between location and all music features")
+```
+
+Furthermore, in Figure 2, the first and second features are highly correlated and this implies a more concise model is possible by feature selection by various methods such as PCA and factor analysis. Detailed methods will be introduced in the next section.
+
+## 3. Methods
+
+By Occam's Razor, it is much attractive to do the analysis on the data with fewer variables, and there exist various feature selection methodologies. First, PCA and kernel PCA will be considered so that we can find the pricipal axis that can maximize the variance of the explanatory variables. Factor analysis can also be considered by introducing latent variables. Both methods seem very similar; however factor analysis does not focus on maximizing the variance of the data. So the results of these two methods will be different and the total explained variance with $q$ sources will also not be the same.
+
+### 3.1. PCA and Kernel PCA
+
+First, in order to find the appropriate number of features, eigendecomposition on the covariance matrix is computed. Then, as in Figure 3, the cumulative variance explained by the number of principal components can be found. With about a half of features, 90% of the variance of the explanatory variables can be explained. In Figure 3, it is notable that the total explained variance increases very smoothly, and this indicates that the explanatory variables have small in-between correlations and the dimension reduction by the principal components analysis may not perform ideally. If there exist explanatory variables with strong discriminative power, a dramatic dimension reduction can be expected.
+
+As discussed previously, the pairwise scatter plots (Figure 2) imply very weak linear relationship, and it is desirable to try find non-linear relationships between response and explanatory variables. One of the kernel options I tried was Gaussian kernel PCA. For the computation I used $kpca$ function which is defined in $kernlab$ require. As in PCA case, 30 Gaussian kernel PCs were collected. 
+
+```{r fig3, fig.height = 3, fig.width = 5, fig.cap = "Proportion of Variance Explained by PCs. The red solid line is 0.9 implying 0.9 of variance of design matrix can be explained with around 30 PCs.", fig.align='center', fig.pos='H', echo=FALSE, message = FALSE}
+n = nrow(Y)
+C=diag(n)-matrix(1,n,n)/n
+sCX=svd(C%*%as.matrix(Y[,-(1:3)]))
+F=sCX$u%*%diag(sCX$d) # p
+{plot(cumsum(sCX$d^2)/sum(sCX$d^2), ylab = "Cumulative Var Proportion", xlab = "# of PCs")
+  abline(h = 0.9, col="red")
+}
+```
+
+### 3.2. Factor Analysis
+The feature selection can also be done by the factor analysis. By introducing latent variables for common and unique factors, we can rewrite the design matrix with those new latent features. The number of features can be determined by hypothesis testing based on the Bayesian Information Criteria (BIC). As in PCA case, Table 2 indicates that the appropriate number of features are 30. 
+```{r echo=FALSE, message = FALSE}
+X = as.matrix(Y[,-c(1,2,3)])
+
+fana_em=function(Y,APsi)
+{
+  #### ---- one EM step
+  Y = as.matrix(Y)
+  A=APsi$A ; Psi=APsi$Psi ; iPsi=diag(1/diag(Psi))
+  Vz=solve( t(A)%*%iPsi%*%A + diag(nrow=ncol(A)) )
+  Zb= Y%*%iPsi%*%A%*%Vz
+  Sb= t(Zb)%*%Zb + nrow(Y)*Vz
+  A=t(Y)%*%Zb%*%solve(Sb)
+  Psi=diag(diag( t(Y)%*%Y - 2*t(Y)%*%Zb%*%t(A) + A%*%Sb%*%t(A) ))/nrow(Y)
+  list(A=A,Psi=Psi)
+}
+
+fana_m2ll=function(Y,APsi)
+{
+  A=APsi$A ; psi=diag(APsi$Psi)
+  B=A/sqrt(psi)
+  
+  sB=svd(B)
+  
+  eval= c(sB$d^2,rep(0,ncol(Y)-ncol(A)) )+1
+  
+  evec= cbind( sB$u , MASS::Null(sB$u) )
+  inSigma=tcrossprod( sweep( sweep(evec,2,sqrt(eval),"/"),1,sqrt(psi),"/" ) )
+  ldSigma= sum(log(eval)) + sum(log(psi))
+  nrow(Y)*ldSigma + sum(diag(crossprod(as.matrix(Y))%*%inSigma) )
+}
+
+fana_mle=function(Y,q,tol=1e-8)
+{
+  ## ---- sweep out mean
+  mu=apply(Y,2,mean)
+  Y=sweep(Y,2,mu,"-")
+  ## ---- starting values
+  s=apply(Y,2,sd)
+  R=cor(Y)
+  
+  tmp=R; diag(tmp)=0 ; h=apply(abs(tmp),1,max)
+  Psi=diag(1-h,nrow=ncol(Y) )
+  
+  for(j in 1:2)
+  {
+    eX=svd( R-Psi,nu=q,nv=0)
+    A=eX$u[,1:q,drop=FALSE]%*%sqrt(diag(eX$d[1:q],nrow=q ))
+    Psi=diag( pmax( diag(R-tcrossprod(A)),1e-3) )
+  }
+  A=sweep(A,1,s,"*")
+  diag(Psi)=diag(Psi)*s^2
+  APsi=list(A=A,Psi=Psi)
+  ## ---- EM algorithm
+  M2LL= c(Inf,fana_m2ll(Y,APsi))
+  
+  while(diff(rev(tail(M2LL,2)))/abs(tail(M2LL,1)) >tol)
+  {APsi=fana_em(Y,APsi)
+  M2LL=c(M2LL,fana_m2ll(Y,APsi) )
+  }
+  ## ---- output
+  list(mu=mu,A=APsi$A, Psi=APsi$Psi, M2LL=M2LL, Sigma=tcrossprod(APsi$A) + APsi$Psi,
+       npq=c(nrow(Y),ncol(Y),ncol(A)))
+}
+
+fana_bic=function(fit)
+{
+  npar= fit$npq[2]*(fit$npq[3]+1) - choose(fit$npq[3],2)
+  tail(fit$M2LL,1) + log(fit$npq[1])*npar
+}
+
+# it takes too much time to run all of them.
+# fit_fana5 = fana_mle(X,5)
+# fit_fana10 = fana_mle(X,10)
+# fit_fana20 = fana_mle(X,20)
+# fit_fana30 = fana_mle(X,30)
+# fit_fana35 = fana_mle(X,35)
+# save(fit_fana5, fit_fana10, fit_fana20, fit_fana30, fit_fana35, file = "fit_fana.Rdata")
+load("fit_fana.Rdata")
+
+tab = sapply( list(fit_fana5, fit_fana10, fit_fana20, fit_fana30, fit_fana35), fana_bic)
+tab = t(as.data.frame(tab))
+rownames(tab) = "BIC"
+colnames(tab) = c("q = 5","q = 10","q = 20","q = 30","q = 35") 
+kable(tab, caption = "BIC comparison for different number of features")
+
+fit_fana = fit_fana30
+
+# Total Variance Explained by Factor Analysis
+VE = sum(diag(crossprod(fit_fana$A)))  / (sum(diag(crossprod(fit_fana$A))) + sum(diag(fit_fana$Psi)))
+
+# Recovery Common Factor
+X = sweep(X,2,apply(X,2,mean),"-")
+A = fit_fana$A; Psi = fit_fana$Psi; q = 30
+Z=( X %*% solve(Psi) %*% A) %*% solve( t(A)%*%solve(Psi)%*%A + diag(q) )
+```
+
+The proportion of total variance explained by 30 features is 
+$\frac{tr(A^TA)}{tr(A^TA + \Psi) } = `r round(VE,2)`$, where $A$ and $\Psi$ are factor loading matrix and unique variance, respectively. It is much less than that by PCA in the previous part. This is because factor analysis does not select features based on the variantion maximization. With only `r round(VE,2)*100`% of variation of the explanatory variables, it might be hard to obtain the robust result as close to as the result by using all 68 variables. The results will be compared in section 4.
+
+```{r echo=FALSE, message = FALSE}
+kpc = kpca(~.,data=Y[,-(1:3)], kernel="rbfdot", features=30)
+```
+
+```{r fig4, fig.height = 3, fig.width = 7, fig.cap = "Scatter Plots of PCs", fig.align='center', fig.pos='H', echo=FALSE, message = FALSE}
+{par(mfrow=c(1,2))
+  plot(F[,1],F[,2], col=Y[,1], pch=as.numeric(Y[,1]), xlab="PC1", ylab="PC2")
+  plot(F[,3],F[,4], col=Y[,1], pch=as.numeric(Y[,1]), xlab="PC3", ylab="PC4")
+}
+```
+```{r fig5, fig.height = 3, fig.width = 7, fig.cap = "Scatter Plots of Features by FA", fig.align='center', fig.pos='H',  echo=FALSE, message = FALSE}
+{par(mfrow=c(1,2))
+  plot(Z[,1],Z[,2], col=Y[,1], pch=as.numeric(Y[,1]), xlab="Feature1", ylab="Feature2")
+  plot(Z[,3],Z[,4], col=Y[,1], pch=as.numeric(Y[,1]), xlab="Feature3", ylab="Feature4")
+}
+```
+```{r fig6, fig.height = 3, fig.width = 7, fig.cap = "Scatter Plots of kernel PCs", fig.align='center', fig.pos='H',  echo=FALSE, message = FALSE}
+{par(mfrow=c(1,2))
+  plot(rotated(kpc)[,1], rotated(kpc)[,2], col=Y[,1], pch=as.numeric(Y[,1]), xlab="Kernel PC1", ylab="Kernel PC2")
+  plot(rotated(kpc)[,3], rotated(kpc)[,4], col=Y[,1], pch=as.numeric(Y[,1]), xlab="Kernel PC3", ylab="Kernel PC4")
+}
+```
+
+Figure 4 through 6 display the performance of new features. However, none of these three methods overcome the others; this can be expected because most of the explanatory variables (music features) were originally uncorrelated. 
+
+
+### 3.4. Linear Regression and Extreme Gradient Boosting Machine (XGBoost)
+
+The diagnostic plots (Figure 7) of the linear regression fittings implies normal assumption on the response variable is possible. This may not true that the origin location of musics has normal distribution because it directly depends on the data collection. Nevertheless, with this data and responses, we can at least make predictions with linear regression model. On the other hand, we can also perform classifications with the data by implicating machine learning algorithms. The performance of linear regression can be improved in terms of increment in $R^2$ by adding interaction terms stepwise and choose new terms based on BIC; however, since there are two response variables -- longitude and latitude -- and two BICs it becomes another optimization problem when it comes to BIC comparison among models. It is not reasonable to sum both BICs of models of longitude and latitude because the scales of BICs are different. In this project, instead of stepwise variable selection for regression model, XGBoost, an algorithm under the gradient boosting framework, will be used to perform the regression and classification with the selected features by three methods above. 
+
+
+```{r fig7, fig.height = 5, fig.width = 5, fig.cap = "Diagnostic Plot for Linear Regression : lm(latitude ~ .)", fig.align='center', fig.pos='H', echo=FALSE, messgae = FALSE}
+fit_lon_prev = lm(lon ~ . - lat - reg - 1, data=Y)
+{par(mfrow=c(2,2))
+plot(fit_lon_prev)
+}
+```
+
+## Results and Summary
+The gradient boosting machine typically use decision trees and make the prediction in the form of an ensemble of the trees. Given an objective function which usually consists of training loss and regularization terms, this algorithm solves the optimization problem by exploiting a gradient descent algorithm to minimize the loss. And XGBoost is a name of a software and one type of gradient boosting machine.
+
+First, the data set was divided into 80% of training set and 20% of test set. In order to solve both classification and regression problems, I used two different models. For the regression, I used longitude and latitude information as the response variable and fitted them into linear regression model. For the classification, I used sub-region information as the only response, and fitted the data into the multinomial model. As the output of the algorithm, Tables 3 and 4 are provided.
+
+```{r echo=FALSE, message = FALSE}
+set.seed(1)
+sam_nums = table(as.numeric(Y[,1])) %/% 5
+
+test_idx = NA
+train_idx = NA
+for (i in 1:15){
+  s = sample(which(as.numeric(Y[,1]) == i))
+
+  test_idx = c(test_idx, s[1 : sam_nums[i]])
+  train_idx = c(train_idx, s[-(1 : sam_nums[i])])
+}
+test_idx = test_idx[-1]; train_idx = train_idx[-1]
+
+
+xgboost_multinomial = function(data, train_idx, test_idx, q){
+  
+  xgb_params = list("objective" = "multi:softprob",
+                     "eval_metric" = "mlogloss",
+                     "num_class" = 15)
+  nround    = 50 # number of XGBoost rounds
+  cv.nfold  = 5
+  
+  train_label = as.numeric(Y[train_idx,1])
+  test_label = as.numeric(Y[test_idx,1])
+  
+  dtrain = xgb.DMatrix(data = data[train_idx,1:q], label = as.numeric(Y[train_idx,1])-1)
+  dtest = xgb.DMatrix(data = data[test_idx,1:q], label = as.numeric(Y[test_idx,1])-1)
+  
+  # Fit cv.nfold * cv.nround XGB models and save OOF predictions
+  cv_model = xgb.cv(params = xgb_params,
+                     data = dtrain, 
+                     nrounds = nround,
+                     nfold = cv.nfold,
+                     verbose = FALSE,
+                     prediction = TRUE)
+  
+  bst_model = xgb.train(params = xgb_params,
+                         data = dtrain,
+                         nrounds = nround)
+  
+  # Predict hold-out test set
+  test_pred = predict(bst_model, newdata = dtest)
+  test_prediction = matrix(test_pred, nrow = 15,
+                            ncol=length(test_pred)/15) %>%
+    t() %>%
+    data.frame() %>%
+    mutate(label = test_label + 1,
+           max_prob = max.col(., "last"))
+  
+  test_prediction
+}
+
+xgboost_reg = function(data, train_idx, test_idx, q){
+  
+  xgb_params = list("objective" = "reg:linear",
+                     "max_depth" = 10, 
+                     "eta" = 0.1,
+                     "nthread" = 1,
+                     "min_child_weight" = 1)
+  nround    = 50 # number of XGBoost rounds
+  cv.nfold  = 5
+  
+  train_label = as.numeric(Y[train_idx,1])
+  test_label = as.numeric(Y[test_idx,1])
+  
+  test_pred = list()
+  for (i in 1:2){
+    dtrain = xgb.DMatrix(data = data[train_idx,1:q], label = as.numeric(Y[train_idx,i+1]))
+    dtest = xgb.DMatrix(data = data[test_idx,1:q], label = as.numeric(Y[test_idx,i+1]))
+    
+    # Fit cv.nfold * cv.nround XGB models and save OOF predictions
+    cv_model = xgb.cv(params = xgb_params,
+                       data = dtrain, 
+                       nrounds = nround,
+                       nfold = cv.nfold,
+                       verbose = FALSE,
+                       prediction = TRUE)
+    
+    bst_model = xgb.train(params = xgb_params,
+                           data = dtrain,
+                           nrounds = nround)
+    
+    # Predict hold-out test set
+    test_pred[[i]] = predict(bst_model, newdata = dtest)
+  }
+
+  test_prediction = do.call(cbind, test_pred)
+  test_prediction
+}
+
+set.seed(1)
+#Classification by XGBoost by softmax multinomial objectives.
+test_pred_pc = xgboost_multinomial(F, train_idx, test_idx, 30) # prediction by 30 PCs
+test_pred_fana = xgboost_multinomial(Z, train_idx, test_idx, 30) # prediction by 30 FA features
+test_pred_kpc = xgboost_multinomial(rotated(kpc), train_idx, test_idx, 30) #prediction by 30 kernel PCs
+test_pred_raw = xgboost_multinomial(as.matrix(Y[,-(1:3)]), train_idx, test_idx, 68) # prediction by 68 raw music features
+
+CM_pc = CM_fana = CM_kpc = CM_raw = matrix(0,nrow=15,ncol=15)
+for (i in 1:length(test_idx)){
+  CM_pc[test_pred_pc$max_prob[i], test_pred_pc$label[i]-1] = CM_pc[test_pred_pc$max_prob[i], test_pred_pc$label[i]-1] + 1
+  CM_fana[test_pred_fana$max_prob[i], test_pred_fana$label[i]-1] = CM_fana[test_pred_fana$max_prob[i], test_pred_fana$label[i]-1] + 1
+  CM_kpc[test_pred_kpc$max_prob[i], test_pred_kpc$label[i]-1] = CM_kpc[test_pred_kpc$max_prob[i], test_pred_kpc$label[i]-1] + 1
+  CM_raw[test_pred_raw$max_prob[i], test_pred_raw$label[i]-1] = CM_raw[test_pred_raw$max_prob[i], test_pred_raw$label[i]-1] + 1
+}
+
+tab = t(rbind(
+  sum(diag(CM_pc)) / length(test_idx),
+  sum(diag(CM_fana)) / length(test_idx),
+  sum(diag(CM_kpc)) / length(test_idx),
+  sum(diag(CM_raw)) / length(test_idx)
+))
+
+colnames(tab) = c("PCA 30", "FA 30", "KPCA 30", "RawData")
+rownames(tab) = c("Prediction Accuracy")
+kable(tab, caption = "Prediction Accuracy with Test Set")
+```
+
+```{r echo=FALSE, message = FALSE}
+set.seed(1)
+test_pred_reg_pc = xgboost_reg(F, train_idx, test_idx, 30)
+test_pred_reg_fana = xgboost_reg(Z, train_idx, test_idx, 30)
+test_pred_reg_kpc = xgboost_reg(rotated(kpc), train_idx, test_idx, 30)
+test_pred_reg_raw = xgboost_reg(as.matrix(Y[,-(1:3)]), train_idx, test_idx, 68)
+
+tab = t(rbind(
+  sqrt(apply((Y[test_idx,2:3] - test_pred_reg_pc)^2,2, sum)),
+  sqrt(apply((Y[test_idx,2:3] - test_pred_reg_fana)^2,2, sum)),
+  sqrt(apply((Y[test_idx,2:3] - test_pred_reg_kpc)^2,2, sum)),
+  sqrt(apply((Y[test_idx,2:3] - test_pred_reg_raw)^2,2, sum))
+))
+colnames(tab) = c("PCA 30", "FA 30", "KPCA 30", "RawData")
+rownames(tab) = c("latitude Root Squared Error", "longitude Root Squred Error")
+kable(tab, caption = "Root Squared Error with Test Set")
+
+```
+
+```{r fig8, fig.height = 4, fig.width = 7,fig.cap = "Prediction Plot for Australia and Caribbean", fig.align='center', fig.pos='H', echo=FALSE, message = FALSE}
+# plot the predictions on map
+test_label = as.numeric(Y[test_idx,1])
+
+index = which(as.numeric(Y[test_idx,1]) %in% c(1,2))
+p = test_pred_reg_kpc
+p2 = test_pred_reg_raw
+p3 = test_pred_reg_pc
+{
+maps::map(fill=TRUE, col=1, main = "Predictions for Australia and Caribbean")
+for (idx in index){
+  points(Y[test_idx,3][idx],Y[test_idx,2][idx], col="red", pch=test_label[idx])
+  points(p[idx,2],
+         p[idx,1],
+         col="blue", pch=test_label[idx])
+  points(p2[idx,2],
+         p2[idx,1],
+         col="green", pch=test_label[idx])
+  points(p3[idx,2],
+         p3[idx,1],
+         col="orange", pch=test_label[idx])
+}
+legend("topleft", legend=c("Pred with RawData", "Pred with kPCA", "Pred with PCA",  "Real Location"),
+       col=c("green", "blue", "orange", "red"), cex=0.5, pch=1, bg="white")
+}
+```
+
+```{r fig9, fig.height = 4, fig.width = 7,fig.cap = "Prediction Plot for Eastern Europe", fig.align='center', fig.pos='H', echo=FALSE, message = FALSE}
+levs = 6
+index = which(as.numeric(Y[test_idx,1]) %in% levs)
+p = test_pred_reg_kpc
+p2 = test_pred_reg_raw
+p3 = test_pred_reg_pc
+
+{
+maps::map(fill=TRUE, col=1, main = as.character(levels(Y[,1][levs])))
+for (idx in index){
+  points(Y[test_idx,3][idx],Y[test_idx,2][idx], col="red", pch=test_label[idx])
+  points(p[idx,2],
+         p[idx,1],
+         col="blue", pch=test_label[idx])
+  points(p2[idx,2],
+         p2[idx,1],
+         col="green", pch=test_label[idx])
+  points(p3[idx,2],
+         p3[idx,1],
+         col="orange", pch=test_label[idx])
+}
+legend("topleft", legend=c("Pred with RawData", "Pred with kPCA", "Pred with PCA",  "Real Location"),
+       col=c("green", "blue", "orange", "red"), cex=0.5, pch=1, bg="white")
+}
+```
+
+In Figures 8 and 9, location predictions based on the regression model were plotted. Especially, in Figure 8, it displays the results of Australia and Caribbean subregions with predictions by various features extracted by different methods. Every data set, even the raw data, does not predict the true subregion properly. Only prediction with kernel PCA for Caribbean subregion may work better than others but it is hard to say it is better in overall. In Figure 9, it displays the results of Eastern Europe subregion. In this case, the prediction with the raw data performs the best; however the difference in performence with other features is quite small. In Table 4, the root squared errors were computed for each longitude and latitude and as we might expect the overall performance of the raw data is the best; however, it is also notable that the new features also worked properly.
+
+Table 3 shows the accuracies of the predictions by each feature sets. The classification was done by multinomial family, and none of longitude and latitude was used for the prediction; only subregion information was used. In this classification problem, the raw data performs the best according to the Table 3, and the rest of features by PCA, kernel PCA and factor Analysis perform quite similarly.
+
+As expected, the results of classification and regression were not satisfiable. The explanatory variables do not have enough discriminatory power, and even with all 68 features the results cannot be good enough. Thus, it is quite natural that the feature selection did not perform well with this example. However, if there exist some explanatory variables with more discriminative power our data, the feature selection might make more sense; the PCA or factor analysis would capture the most important features and dramatic dimensional reduction would be expected. Zhou et al. (2014) also did a regression on the same data by using random forest tree algorithm. The mean circle distance error was 3,113 km which was still large. For better prediction, other audio feature extraction methods should be considered in order for features with more discriminative power.
+
+## Citations
+1. Tzanetakis, G., & Cook, P. (2000). MARSYAS: A framework for audio analysis. Organised Sound, 4(3), 169-175.
+
+2. Zhou, Fang & Claire, Q & D. King, Ross. (2015). Predicting the Geographical Origin of Music. Proceedings - IEEE International Conference on Data Mining, ICDM. 2015. 1115-1120. 10.1109/ICDM.2014.73. 
+
+3. Chen, Tianqi & Guestrin, Carlos (2016). XGBoost: Scalable Tree Boosting System. CoRR. abs/1603.02754.
+
+
+
